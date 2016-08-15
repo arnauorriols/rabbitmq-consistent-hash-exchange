@@ -91,9 +91,11 @@ route(#exchange { name      = Name,
 
 validate(#exchange { arguments = Args }) ->
     case hash_args(Args) of
-        {undefined, undefined} ->
+        {undefined, undefined, undefined} ->
             ok;
-        {undefined, {_Type, Value}} ->
+        {undefined, undefined, {_Type, _SegmentSpec}} ->
+            ok;
+        {undefined, {_Type, Value}, undefined} ->
             case lists:member(Value, ?PROPERTIES) of
                 true  -> ok;
                 false ->
@@ -101,11 +103,11 @@ validate(#exchange { arguments = Args }) ->
                                                "Unsupported property: ~s",
                                                [Value])
             end;
-        {_, undefined} ->
+        {_, undefined, undefined} ->
             ok;
-        {_, _} ->
+        {_, _, _} ->
             rabbit_misc:protocol_error(precondition_failed,
-                                       "hash-header and hash-property are mutually exclusive",
+                                       "hash-header, hash-property and hash-routing-key-segment are mutually exclusive",
                                        [])
     end.
 
@@ -191,6 +193,11 @@ find_numbers(Source, N, Acc) ->
 
 hash(undefined, #basic_message { routing_keys = Routes }) ->
     Routes;
+hash({rk_segment, SegmentSpec}, #basic_message { routing_keys = Routes }) ->
+    [begin
+         RouteSegments = split_rk_into_segments(Route),
+         list_to_binary(select_segments(RouteSegments, SegmentSpec))
+     end || Route <- Routes];
 hash({header, Header}, #basic_message { content = Content }) ->
     Headers = rabbit_basic:extract_headers(Content),
     case Headers of
@@ -223,11 +230,36 @@ hash_args(Args) ->
             undefined     -> undefined;
             {longstr, V2} -> {property, V2}
         end,
-    {Header, Property}.
+    RKSegment =
+        case rabbit_misc:table_lookup(Args, <<"hash-routing-key-segment">>) of
+            undefined     -> undefined;
+            {longstr, V3} -> {rk_segment, split_rk_into_segments(V3)}
+        end,
+    {Header, Property, RKSegment}.
 
 hash_on(Args) ->
     case hash_args(Args) of
-        {undefined, undefined} -> undefined;
-        {Header, undefined}    -> Header;
-        {undefined, Property}  -> Property
+        {undefined, undefined, undefined} -> undefined;
+        {undefined, undefined, RKSegment} -> RKSegment;
+        {Header, undefined, undefined}    -> Header;
+        {undefined, Property, undefined}  -> Property
     end.
+
+select_segments(Segments, SegmentSpec) ->
+    select_segments(Segments, SegmentSpec, []).
+
+select_segments([], [_ | _], Acc) ->
+    Acc;
+select_segments([_, _], [], Acc) ->
+    Acc;
+select_segments([], [], Acc) ->
+    Acc;
+select_segments(RestSegments, [<<"#">> | _], Acc) ->
+    RestSegments ++ Acc;
+select_segments([_ | RestSegments], [<<>> | RestSegmentSpec], Acc) ->
+    select_segments(RestSegments, RestSegmentSpec, Acc);
+select_segments([Segment | RestSegments], [_ | RestSegmentSpec], Acc) ->
+    select_segments(RestSegments, RestSegmentSpec, [Segment | Acc]).
+
+split_rk_into_segments(RK) ->
+    binary:split(RK, <<".">>, [global]).

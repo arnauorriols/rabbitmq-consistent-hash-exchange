@@ -77,6 +77,7 @@ routing_test(Config) ->
 
 routing_test0(Config, Qs) ->
     ok = test_with_rk(Config, Qs),
+    ok = test_with_rk_segment(Config, Qs),
     ok = test_with_header(Config, Qs),
     ok = test_binding_with_negative_routing_key(Config),
     ok = test_binding_with_non_numeric_routing_key(Config),
@@ -99,6 +100,52 @@ test_with_rk(Config, Qs) ->
                   #amqp_msg{props = #'P_basic'{}, payload = <<>>}
           end, [], Qs).
 
+test_with_rk_segment(Config, Queues) ->
+    RKSegmentSpec = <<"*..#">>,
+    MsgsRK = fun () -> list_to_binary(
+                         lists:join(<<".">>,
+                                    [<<"static">>, rnd(), <<"static">>, <<"static">>]))
+             end,
+    Count = 100,
+    Chan = rabbit_ct_client_helpers:open_channel(Config, 0),
+    #'exchange.declare_ok'{} =
+        amqp_channel:call(Chan, #'exchange.declare'{
+                                   exchange = <<"e">>,
+                                   type = <<"x-consistent-hash">>,
+                                   auto_delete = true,
+                                   arguments = [{<<"hash-routing-key-segment">>,
+                                                 longstr,
+                                                 RKSegmentSpec}]
+                                  }),
+    [#'queue.declare_ok'{} =
+         amqp_channel:call(Chan, #'queue.declare'{queue = Q, exclusive = true})
+     || Q <- Queues],
+    [#'queue.bind_ok'{} =
+         amqp_channel:call(Chan, #'queue.bind' {queue = Q,
+                                                exchange = <<"e">>,
+                                                routing_key = <<"20">>})
+     || Q <- Queues],
+    #'tx.select_ok'{} = amqp_channel:call(Chan, #'tx.select'{}),
+    [amqp_channel:call(Chan,
+                       #'basic.publish'{exchange = <<"e">>, routing_key = MsgsRK()},
+                       #amqp_msg{props = #'P_basic'{}, payload = <<>>})
+     || _ <- lists:duplicate(Count, const)],
+    amqp_channel:call(Chan, #'tx.commit'{}),
+    Counts =
+        [begin
+             #'queue.declare_ok'{message_count = M} =
+                 amqp_channel:call(Chan, #'queue.declare'{queue = Q,
+                                                          exclusive = true}),
+             M
+         end || Q <- Queues],
+    Count = lists:sum(Counts), %% All messages got routed
+    % all messages got routed to a single queue
+    1 = length(lists:filter(fun (C) -> C =:= Count end,  Counts)),
+    amqp_channel:call(Chan, #'exchange.delete' {exchange = <<"e">>}),
+    [amqp_channel:call(Chan, #'queue.delete' {queue = Q}) || Q <- Queues],
+    rabbit_ct_client_helpers:close_channel(Chan),
+    ok.
+
 test_with_header(Config, Qs) ->
     test0(Config, fun () ->
                   #'basic.publish'{exchange = <<"e">>}
@@ -107,7 +154,6 @@ test_with_header(Config, Qs) ->
                   H = [{<<"hashme">>, longstr, rnd()}],
                   #amqp_msg{props = #'P_basic'{headers = H}, payload = <<>>}
           end, [{<<"hash-header">>, longstr, <<"hashme">>}], Qs).
-
 
 test_with_correlation_id(Config, Qs) ->
     test0(Config, fun() ->
